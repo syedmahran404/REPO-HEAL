@@ -1,13 +1,25 @@
 """Concrete validators.
 
-Phase 1: ``SyntaxValidator`` (Python, real).
+Phase 1: ``SyntaxValidator`` (Python, AST-based).
 
-Planned (each one PR):
-  * ``LintValidator``        — wraps `ruff check`.
-  * ``TypeCheckValidator``   — wraps `mypy`.
-  * ``UnitTestValidator``    — wraps `pytest --co -q` then `pytest`.
-  * ``BuildValidator``       — wraps the ecosystem's build command.
-  * ``SecurityScanValidator``— wraps `detect-secrets`.
+Phase 2 adds three sandbox-backed validators:
 
-All run inside the sandbox runner.
+* ``RuffLintValidator``  — wraps ``ruff check`` with JSON output.
+* ``MypyTypeValidator``  — wraps ``mypy`` with structured parse.
+* ``PytestValidator``    — wraps ``pytest`` and parses summary + failures.
+
+All three accept an injectable :class:`SandboxRunner` so tests can
+substitute a fake runner with canned outputs.
 """
+
+from .lint import RuffLintValidator
+from .syntax import SyntaxValidator
+from .tests import PytestValidator
+from .types import MypyTypeValidator
+
+__all__ = [
+    "MypyTypeValidator",
+    "PytestValidator",
+    "RuffLintValidator",
+    "SyntaxValidator",
+]

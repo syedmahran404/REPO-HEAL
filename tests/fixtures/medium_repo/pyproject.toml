@@ -1,0 +1,5 @@
+[project]
+name = "medium-repo"
+version = "0.0.0"
+description = "REPO-HEAL fixture: a Python package exercising Phase 2 features (call graph, inheritance, decorators, dead code, secrets, etc.)."
+requires-python = ">=3.10"

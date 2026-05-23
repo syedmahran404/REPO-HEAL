@@ -54,6 +54,11 @@ ml = [
   "numpy>=1.26",
   "rank-bm25>=0.2.2",
 ]
+obs = [
+  "opentelemetry-api>=1.25",
+  "opentelemetry-sdk>=1.25",
+  "opentelemetry-exporter-otlp-proto-http>=1.25",
+]
 neo4j = ["neo4j>=5.20"]
 postgres = ["asyncpg>=0.29", "sqlalchemy>=2.0"]
 

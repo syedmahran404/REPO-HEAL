@@ -510,3 +510,146 @@ Phase 1 deployment is `uvicorn repoheal.api.main:app` on one box. The architectu
 It is not a marketing document. Every claim it makes about implementation status maps to a file in this repo or an issue in `ROADMAP.md`. Where it says **PLANNED**, no code exists. Where it says **INTERFACE-DEFINED**, a `Protocol` exists with no concrete implementation. Where it says **IMPLEMENTED**, there is real code with tests.
 
 That distinction is the entire reason this document exists.
+
+
+
+---
+
+# Phase 2 additions — Repository Intelligence Engine
+
+This section documents what landed in Phase 2 on top of the foundation above. The original architecture stays intact; Phase 2 is additive.
+
+## P2.1 Knowledge graph: real call / inheritance / reference edges
+
+`src/repoheal/intelligence/calls.py` implements heuristic identifier resolution for Python (see ADR-0006). On top of the existing `IMPORTS` / `CONTAINS` edges, the graph now carries:
+
+- **`CALLS`** — `Function|Method` → `Function|Method`, when a `call` AST node's textual callee resolves unambiguously to one symbol in scope.
+- **`INHERITS`** — `Class` → `Class`, when a class's base is in scope.
+- **`REFERENCES`** — `Module|Function|Method` → `Class|Function|Method`, when a top-level expression names a known symbol.
+
+Resolution is **scoped, conservative, drop-on-ambiguous**. False negatives are accepted; false positives are designed out. This unlocks dead-code detection, real downstream/upstream impact analysis, and the root-cause agent.
+
+## P2.2 Hybrid retrieval engine
+
+`src/repoheal/retrieval/` evolves from Protocols-only into a working pipeline:
+
+```
+query
+  │
+  ├─▶ chunker (symbol-aware) ──▶ corpus (BM25 + vector indices)
+  │
+query → tokenize ─┬──▶ BM25 lane ────────────────┐
+                  │                                ├──▶ RRF fusion
+                  └──▶ embed → vector lane ──────┘
+                                                     │
+                              graph 1-hop expansion ◀┘
+                                                     │
+                                              token-budget pack ──▶ chunks
+```
+
+- **`SymbolAwareChunker`**: chunks respect symbol boundaries (function / class). Long classes are split per-method. Each chunk carries a `SourceRange` and a back-reference to its symbol's qualified name, so the graph expansion stage can find structural neighbors.
+- **`IdentifierTokenizer`**: splits `camelCase`, `snake_case`, `dotted.paths`, and preserves the original token. This is the crucial step that makes BM25 useful for code.
+- **`BM25Retriever`**: pure-python `rank-bm25` is in the optional `[ml]` extra; the default uses an in-process implementation in `bm25.py` (~80 LoC, tf-idf with the Okapi BM25 weighting). No external dependency required for the dev-grade lane.
+- **`InMemoryVectorStore`**: numpy-free; uses Python's `array` and a brute-force cosine. Adequate up to ~50k chunks. FAISS and Qdrant backends will plug in behind the existing Protocol.
+- **`HashEmbeddingProvider`** + **`SentenceTransformersEmbeddingProvider`**: see ADR-0005.
+- **`RRFFusion`**: reciprocal rank fusion, no tuning.
+- **`GraphExpansion`**: given the fused top-k chunks, walks `CALLS` / `IMPORTS` edges 1 hop and admits structurally-related chunks if they have BM25 overlap > threshold.
+- **`TokenBudgetPacker`**: greedy packing under a token budget, ordered by fused score, with hard ceilings per file to avoid context being dominated by one mega-class.
+- **`RetrievalCache`**: bounded LRU keyed on `(repo_id, query, top_k, token_budget)`.
+- **`RetrievalService`**: the orchestrator. Builds indices on first `search()`, reuses them, exposes timing telemetry per stage.
+
+## P2.3 Detection rules
+
+`src/repoheal/detection/rules/python_rules.py` grows from 1 rule to 8. Every rule emits a `Finding` with `confidence` in `metadata`, `severity` set per-rule, and human-readable `description`.
+
+| Rule id | What it finds | Source of truth |
+|---|---|---|
+| `circular_imports` | Phase 1 — module SCC > 1 in the IMPORTS subgraph | graph |
+| `unused_imports` | imports whose names are never referenced in the file | AST |
+| `mutable_default_args` | `def f(x=[])` and friends | AST |
+| `broad_except` | `except Exception:` or `except:` without re-raise | AST |
+| `dead_code` | functions/methods with zero in-edges in `CALLS ∪ REFERENCES` | graph |
+| `long_method` | functions whose body exceeds threshold lines (config) | symbols |
+| `god_class` | classes whose method count exceeds threshold (config) | graph |
+| `hardcoded_secret` | high-entropy string literals that match key patterns | AST + entropy |
+
+Each rule is independently testable and ~50–120 LoC.
+
+## P2.4 Real validators
+
+`src/repoheal/validation/checks/` adds three sandbox-backed validators:
+
+- **`RuffLintValidator`** — runs `ruff check --output-format=json` in the sandbox, parses the JSON output, returns `WARN` for non-error severities and `FAIL` for errors. Tool-not-found returns `WARN` with a clear message (we don't fail patches because the user lacks ruff installed).
+- **`MypyTypeValidator`** — runs `mypy --no-error-summary` and parses the structured output. Same fail-closed semantics.
+- **`PytestValidator`** — runs `pytest -q --no-header --no-summary --tb=line --maxfail=5`, returns `FAIL` if any test fails. Streams output through the sandbox's bounded buffers.
+
+Each validator accepts an injectable `SandboxRunner`, so tests substitute a fake runner with canned outputs.
+
+## P2.5 Agent orchestration runtime
+
+`src/repoheal/agents/` goes from interface-only to a real runtime (ADR-0004).
+
+- **`MemoryBus`** — typed key/value store. In-memory backend for tests, file-on-disk backend for dev (`JsonFileMemoryBus`).
+- **`AgentRunner`** — runs one agent with: bounded retries (configurable, default 2), wallclock timeout (default 60s), token budget (advisory; the agent enforces it), structured exception capture, telemetry span per attempt.
+- **`ExecutionDAG`** — typed adjacency list. Validates topology (no cycles) at construction.
+- **`Orchestrator`** — topo-schedules the DAG, fans out independent steps via `asyncio.gather`, persists state via the `MemoryBus` after every step. Resumes from persisted state on the same `run_id`.
+- **`AgentRegistry`** — name → constructor, with `default_registry()` returning the canonical wiring.
+
+One real, non-LLM agent ships:
+
+- **`RootCauseAgent`** — given a finding or a parsed traceback, walks the graph upstream along `CALLS` / `REFERENCES` / `IMPORTS` edges, ranks candidates by graph distance + retrieval similarity to the failing symbol's source, and emits `RootCauseHypothesis` records with confidence. End-to-end testable without an LLM.
+
+LLM-backed agents (`PatchGenerationAgent`, `RefactoringAgent`, etc.) are next; the runtime accepts them once the `LLMClient` Protocol lands.
+
+## P2.6 Patch ranking
+
+`src/repoheal/patching/ranking.py` ranks multiple candidate `Patch` objects using composable `Scorer` callables:
+
+- **`ValidationScorer`** — pass=1.0, warn=0.5, fail=0.0.
+- **`DiffSizeScorer`** — `1 / (1 + lines_changed / 50)`. Small fixes preferred.
+- **`GraphImpactScorer`** — `1 / (1 + downstream_count)`. Patches that touch broadly-referenced symbols are penalised.
+- **`StyleConsistencyScorer`** — heuristics on indentation, EOL, quote style.
+
+`PatchRanker` accepts a list of `(scorer, weight)` and emits a `RankingScore` per patch with the per-component breakdown. The breakdown is the explainability story: every score traces back to an interpretable component.
+
+## P2.7 Stack-trace correlation
+
+`src/repoheal/runtime/traceback.py` parses Python tracebacks (and the more common variant with leading whitespace from logs) into `StackFrame` records. `runtime/correlation.py` maps each frame's `(file, line)` into the closest containing graph node by `range`. The output is a `CorrelatedTraceback` ready for an agent to consume.
+
+## P2.8 GitHub issue source
+
+`src/repoheal/issues/github.py` is a real `IssueSource`:
+
+- httpx-based, with token auth via `GITHUB_TOKEN`.
+- Fetches issue body + comments via `GET /repos/:owner/:repo/issues/:n` and `GET /repos/:owner/:repo/issues/:n/comments`.
+- Extracts stack traces from issue bodies / comments via regex; correlates them via `runtime/correlation`.
+- Correlates the issue text to candidate files via the retrieval service.
+- Returns an `Issue` aggregate enriched with `candidate_files` and `correlated_traceback`.
+
+PR creation deferred to a Phase 3 PR.
+
+## P2.9 OpenTelemetry hooks
+
+`src/repoheal/obs/tracing.py`:
+
+- `init_tracing(service_name, exporter)` — initialises a `TracerProvider`. Default exporter is in-memory (test); OTLP exporter activates when `REPOHEAL_OTLP_ENDPOINT` is set.
+- `traced(name)` — context manager + decorator for both sync and async code. Captures duration, exception, and arbitrary attributes.
+- Spans now wrap: clone, walk, parse, graph build, detection (per rule), retrieval (per stage), agent step, validator run.
+
+If OpenTelemetry isn't installed, the module no-ops gracefully and tracing becomes free.
+
+## P2.10 API & CLI surface added
+
+| Method + Path | Purpose |
+|---|---|
+| `POST /retrieval/search` | Run the hybrid retriever against a path and query. |
+| `POST /agents/run` | Invoke an agent by name with an inputs dict. |
+| `POST /patches/rank` | Rank candidate patches. |
+| `POST /issues/correlate` | Map an issue body to candidate files / frames. |
+| `GET /telemetry/spans/recent` | Dev-mode introspection of the in-memory span buffer. |
+
+CLI subcommands `search`, `agent run`, `repair`, `trace`, `issue correlate` mirror the API.
+
+## What stayed the same
+
+Phase 1 modules (`core/`, `ingestion/`, `intelligence/parser.py`, `graph/networkx_backend.py`, `graph/queries.py`, `patching/applier.py`, `validation/pipeline.py`, `sandbox/runner.py`, `api/main.py`) are touched only additively. No Phase-1 test was modified. All Phase-1 behaviour is preserved.

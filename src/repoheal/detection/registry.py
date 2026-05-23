@@ -13,6 +13,7 @@ from ..core.models import Finding, Repository
 from ..core.protocols import DetectionRule, GraphBackend
 from ..exceptions import DetectionError
 from ..logging import get_logger
+from ..obs.tracing import traced
 
 _log = get_logger(__name__)
 
@@ -68,21 +69,22 @@ class RuleRegistry:
 
         findings: list[Finding] = []
         for rule in rules:
-            try:
-                rule_findings = list(rule.scan(repo, graph))
-            except Exception as exc:
-                _log.warning(
-                    "detection.rule_failed",
+            with traced("detection.rule", rule_id=rule.rule_id):
+                try:
+                    rule_findings = list(rule.scan(repo, graph))
+                except Exception as exc:
+                    _log.warning(
+                        "detection.rule_failed",
+                        rule_id=rule.rule_id,
+                        error=str(exc),
+                    )
+                    continue
+                _log.info(
+                    "detection.rule_done",
                     rule_id=rule.rule_id,
-                    error=str(exc),
+                    count=len(rule_findings),
                 )
-                continue
-            _log.info(
-                "detection.rule_done",
-                rule_id=rule.rule_id,
-                count=len(rule_findings),
-            )
-            findings.extend(rule_findings)
+                findings.extend(rule_findings)
         return findings
 
 
@@ -92,9 +94,31 @@ class RuleRegistry:
 def default_registry() -> RuleRegistry:
     """Construct the canonical rule registry.
 
-    As we add rules in subsequent PRs, register them here.
+    Phase 1: circular imports.
+    Phase 2: unused imports, mutable default args, broad except, dead
+    code, long method, god class, hardcoded secret.
     """
     # Local import to avoid circular import with the rules module.
-    from .rules.python_rules import CircularImportRule
+    from .rules.python_rules import (
+        BroadExceptRule,
+        CircularImportRule,
+        DeadCodeRule,
+        GodClassRule,
+        HardcodedSecretRule,
+        LongMethodRule,
+        MutableDefaultArgsRule,
+        UnusedImportRule,
+    )
 
-    return RuleRegistry([CircularImportRule()])
+    return RuleRegistry(
+        [
+            CircularImportRule(),
+            UnusedImportRule(),
+            MutableDefaultArgsRule(),
+            BroadExceptRule(),
+            DeadCodeRule(),
+            LongMethodRule(),
+            GodClassRule(),
+            HardcodedSecretRule(),
+        ]
+    )
