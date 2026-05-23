@@ -4,12 +4,34 @@ A rule is a class implementing :class:`DetectionRule`. Rules are
 registered with a :class:`RuleRegistry`; the registry can run every rule
 or a named subset.
 
-Phase 1 ships one rule: ``circular_imports``. Adding a rule is a
-one-class affair (see :mod:`repoheal.detection.rules.python_rules` for
-the canonical example).
+Phase 1: ``circular_imports``.
+
+Phase 2 adds: ``unused_imports``, ``mutable_default_args``,
+``broad_except``, ``dead_code``, ``long_method``, ``god_class``,
+``hardcoded_secret``. All rules emit ``confidence`` and a ``severity``.
 """
 
 from .registry import RuleRegistry, default_registry
-from .rules.python_rules import CircularImportRule
+from .rules import (
+    BroadExceptRule,
+    CircularImportRule,
+    DeadCodeRule,
+    GodClassRule,
+    HardcodedSecretRule,
+    LongMethodRule,
+    MutableDefaultArgsRule,
+    UnusedImportRule,
+)
 
-__all__ = ["CircularImportRule", "RuleRegistry", "default_registry"]
+__all__ = [
+    "BroadExceptRule",
+    "CircularImportRule",
+    "DeadCodeRule",
+    "GodClassRule",
+    "HardcodedSecretRule",
+    "LongMethodRule",
+    "MutableDefaultArgsRule",
+    "RuleRegistry",
+    "UnusedImportRule",
+    "default_registry",
+]

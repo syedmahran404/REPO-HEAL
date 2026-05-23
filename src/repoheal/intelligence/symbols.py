@@ -30,6 +30,9 @@ from ..core.models import (
     SourceRange,
     Symbol,
     SymbolKind,
+    UnresolvedCall,
+    UnresolvedInheritance,
+    UnresolvedReference,
 )
 
 if TYPE_CHECKING:
@@ -140,6 +143,292 @@ class PythonSymbolExtractor:
                     self._import_edges_from_import_from(node, source, parsed.file.path)
                 )
         return edges
+
+    # ------------------------------------------------------------------
+    # Calls / inheritance / references (Phase 2)
+    # ------------------------------------------------------------------
+
+    def extract_calls(
+        self,
+        parsed: ParsedFile,
+        source: bytes,
+        *,
+        tree: Tree | None = None,
+    ) -> Sequence[UnresolvedCall]:
+        """Find every ``call`` AST node and emit an UnresolvedCall.
+
+        We track the enclosing scope (qualified name stack) so the
+        graph builder can attribute each call to the right caller.
+        """
+        if tree is None:
+            return []
+
+        out: list[UnresolvedCall] = []
+        module_qname = _module_qualified_name(parsed.file.path)
+        self._walk_callsites(
+            node=tree.root_node,
+            source=source,
+            file_path=parsed.file.path,
+            qname_stack=[module_qname],
+            out=out,
+        )
+        return out
+
+    def extract_inheritance(
+        self,
+        parsed: ParsedFile,
+        source: bytes,
+        *,
+        tree: Tree | None = None,
+    ) -> Sequence[UnresolvedInheritance]:
+        """Walk every ``class_definition`` and emit one record per base class."""
+        if tree is None:
+            return []
+
+        out: list[UnresolvedInheritance] = []
+        module_qname = _module_qualified_name(parsed.file.path)
+        self._walk_inheritance(
+            node=tree.root_node,
+            source=source,
+            file_path=parsed.file.path,
+            parent_qualified=module_qname,
+            out=out,
+        )
+        return out
+
+    def extract_references(
+        self,
+        parsed: ParsedFile,
+        source: bytes,
+        *,
+        tree: Tree | None = None,
+    ) -> Sequence[UnresolvedReference]:
+        """Walk decorators and emit a reference from the decorated symbol
+        to the decorator target.
+
+        Decorators carry the highest signal for "is this used?" analysis
+        because frameworks (FastAPI, Flask, Click, pytest) keep
+        otherwise-uncalled functions alive via @register-style hooks.
+        """
+        if tree is None:
+            return []
+
+        out: list[UnresolvedReference] = []
+        module_qname = _module_qualified_name(parsed.file.path)
+        self._walk_decorators(
+            node=tree.root_node,
+            source=source,
+            file_path=parsed.file.path,
+            parent_qualified=module_qname,
+            out=out,
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # Internal walkers for calls / inheritance / decorators (Phase 2)
+    # ------------------------------------------------------------------
+
+    def _walk_callsites(
+        self,
+        *,
+        node: Node,
+        source: bytes,
+        file_path: Path,
+        qname_stack: list[str],
+        out: list[UnresolvedCall],
+    ) -> None:
+        if node.type == "function_definition":
+            name = _named_child_text(node, "name", source) or "<anonymous>"
+            qname_stack.append(f"{qname_stack[-1]}.{name}")
+            try:
+                body = node.child_by_field_name("body")
+                if body is not None:
+                    for c in body.children:
+                        self._walk_callsites(
+                            node=c,
+                            source=source,
+                            file_path=file_path,
+                            qname_stack=qname_stack,
+                            out=out,
+                        )
+            finally:
+                qname_stack.pop()
+            return
+
+        if node.type == "class_definition":
+            name = _named_child_text(node, "name", source) or "<anonymous>"
+            qname_stack.append(f"{qname_stack[-1]}.{name}")
+            try:
+                body = node.child_by_field_name("body")
+                if body is not None:
+                    for c in body.children:
+                        self._walk_callsites(
+                            node=c,
+                            source=source,
+                            file_path=file_path,
+                            qname_stack=qname_stack,
+                            out=out,
+                        )
+            finally:
+                qname_stack.pop()
+            return
+
+        if node.type == "call":
+            func = node.child_by_field_name("function")
+            if func is not None:
+                callee = _node_text(func, source).strip()
+                if callee and not callee.startswith(("(", "[")):
+                    out.append(
+                        UnresolvedCall(
+                            file=file_path,
+                            caller_qname=qname_stack[-1],
+                            callee_text=callee,
+                            range=_range_from_node(node),
+                        )
+                    )
+            for child in node.children:
+                if child is func:
+                    continue
+                self._walk_callsites(
+                    node=child,
+                    source=source,
+                    file_path=file_path,
+                    qname_stack=qname_stack,
+                    out=out,
+                )
+            return
+
+        for child in node.children:
+            self._walk_callsites(
+                node=child,
+                source=source,
+                file_path=file_path,
+                qname_stack=qname_stack,
+                out=out,
+            )
+
+    def _walk_inheritance(
+        self,
+        *,
+        node: Node,
+        source: bytes,
+        file_path: Path,
+        parent_qualified: str,
+        out: list[UnresolvedInheritance],
+    ) -> None:
+        for child in node.children:
+            if child.type == "class_definition":
+                name = _named_child_text(child, "name", source) or "<anonymous>"
+                child_qname = f"{parent_qualified}.{name}"
+                supers = child.child_by_field_name("superclasses")
+                if supers is not None:
+                    for sc in supers.named_children:
+                        if sc.type == "keyword_argument":
+                            continue
+                        text = _node_text(sc, source).strip()
+                        if not text:
+                            continue
+                        out.append(
+                            UnresolvedInheritance(
+                                file=file_path,
+                                child_qname=child_qname,
+                                parent_text=text,
+                                range=_range_from_node(sc),
+                            )
+                        )
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    for c in body.children:
+                        self._walk_inheritance(
+                            node=c,
+                            source=source,
+                            file_path=file_path,
+                            parent_qualified=child_qname,
+                            out=out,
+                        )
+
+            elif child.type == "decorated_definition":
+                self._walk_inheritance(
+                    node=child,
+                    source=source,
+                    file_path=file_path,
+                    parent_qualified=parent_qualified,
+                    out=out,
+                )
+            elif child.named_child_count > 0:
+                self._walk_inheritance(
+                    node=child,
+                    source=source,
+                    file_path=file_path,
+                    parent_qualified=parent_qualified,
+                    out=out,
+                )
+
+    def _walk_decorators(
+        self,
+        *,
+        node: Node,
+        source: bytes,
+        file_path: Path,
+        parent_qualified: str,
+        out: list[UnresolvedReference],
+    ) -> None:
+        for child in node.children:
+            if child.type == "decorated_definition":
+                wrapped = child.child_by_field_name("definition")
+                if wrapped is None and child.named_children:
+                    wrapped = child.named_children[-1]
+                if wrapped is None:
+                    continue
+
+                wrapped_name = _named_child_text(wrapped, "name", source)
+                if wrapped_name is None:
+                    continue
+                wrapped_qname = f"{parent_qualified}.{wrapped_name}"
+
+                for dec in child.named_children:
+                    if dec.type != "decorator":
+                        continue
+                    target = _decorator_target(dec, source)
+                    if target is None:
+                        continue
+                    out.append(
+                        UnresolvedReference(
+                            file=file_path,
+                            referrer_qname=wrapped_qname,
+                            target_text=target,
+                            range=_range_from_node(dec),
+                        )
+                    )
+
+                self._walk_decorators(
+                    node=wrapped,
+                    source=source,
+                    file_path=file_path,
+                    parent_qualified=parent_qualified,
+                    out=out,
+                )
+
+            elif child.type in ("function_definition", "class_definition"):
+                name = _named_child_text(child, "name", source) or "<anonymous>"
+                inner_qname = f"{parent_qualified}.{name}"
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    self._walk_decorators(
+                        node=body,
+                        source=source,
+                        file_path=file_path,
+                        parent_qualified=inner_qname,
+                        out=out,
+                    )
+            elif child.named_child_count > 0:
+                self._walk_decorators(
+                    node=child,
+                    source=source,
+                    file_path=file_path,
+                    parent_qualified=parent_qualified,
+                    out=out,
+                )
 
     # ------------------------------------------------------------------
     # Internal walk
@@ -399,3 +688,23 @@ def _walk_named(cursor: Any) -> list[Node]:
 
     push(cursor.node)
     return out
+
+
+def _decorator_target(decorator_node: Node, source: bytes) -> str | None:
+    """Extract the textual target of a decorator.
+
+    Tree-sitter-python represents ``@register`` as a decorator node
+    whose payload is an identifier; ``@app.get("/")`` as a decorator
+    whose payload is a call whose function is an attribute. We want
+    the *callable* target — for plain decorators that's the identifier;
+    for parameterised decorators that's the function being called.
+    """
+    if decorator_node.named_child_count == 0:
+        return None
+    payload = decorator_node.named_children[0]
+    if payload.type == "call":
+        func = payload.child_by_field_name("function")
+        if func is None:
+            return None
+        return _node_text(func, source).strip() or None
+    return _node_text(payload, source).strip() or None

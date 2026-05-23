@@ -19,9 +19,14 @@ from fastapi import FastAPI
 from ..analysis import AnalysisService
 from ..config import get_settings
 from ..logging import configure_logging, get_logger
+from .routes import agents as agent_routes
 from .routes import graph as graph_routes
 from .routes import health as health_routes
+from .routes import issues as issue_routes
+from .routes import patches as patch_routes
 from .routes import repositories as repo_routes
+from .routes import retrieval as retrieval_routes
+from .routes import telemetry as telemetry_routes
 
 
 def create_app(*, analysis: AnalysisService | None = None) -> FastAPI:
@@ -51,6 +56,11 @@ def create_app(*, analysis: AnalysisService | None = None) -> FastAPI:
     app.include_router(health_routes.router)
     app.include_router(repo_routes.router)
     app.include_router(graph_routes.router)
+    app.include_router(retrieval_routes.router)
+    app.include_router(agent_routes.router)
+    app.include_router(patch_routes.router)
+    app.include_router(issue_routes.router)
+    app.include_router(telemetry_routes.router)
 
     return app
 

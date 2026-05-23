@@ -195,6 +195,50 @@ class ImportEdge(BaseModel):
     alias: str | None = None
 
 
+class UnresolvedCall(BaseModel):
+    """A textual call site whose callee has not yet been resolved.
+
+    Resolution happens in the graph builder, which has the global
+    symbol index. Keeping resolution as a separate phase keeps the
+    parser pure-lexical and makes the resolver swappable (heuristic
+    today, type-aware tomorrow).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    file: Path  # relative
+    caller_qname: str  # qualified name of the enclosing function/method/module
+    callee_text: str  # what the source said: ``foo``, ``obj.bar``, ``pkg.mod.baz``
+    range: SourceRange
+
+
+class UnresolvedInheritance(BaseModel):
+    """A `class Foo(Bar)` superclass whose target has not been resolved."""
+
+    model_config = ConfigDict(frozen=True)
+
+    file: Path
+    child_qname: str  # qualified name of the subclass
+    parent_text: str  # textual base, e.g. ``Bar`` or ``pkg.Bar``
+    range: SourceRange
+
+
+class UnresolvedReference(BaseModel):
+    """A non-call reference to a symbol (e.g. a decorator target).
+
+    Decorators are the highest-signal references for "is this still
+    used?" analysis: framework-registered functions look dead by
+    call graph alone but are alive via @register-style references.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    file: Path
+    referrer_qname: str
+    target_text: str
+    range: SourceRange
+
+
 class ParsedFile(BaseModel):
     """The structured outcome of parsing a single file."""
 
@@ -204,6 +248,9 @@ class ParsedFile(BaseModel):
     language: Language
     symbols: list[Symbol] = Field(default_factory=list)
     imports: list[ImportEdge] = Field(default_factory=list)
+    calls: list[UnresolvedCall] = Field(default_factory=list)
+    inherits: list[UnresolvedInheritance] = Field(default_factory=list)
+    references: list[UnresolvedReference] = Field(default_factory=list)
     parse_errors: list[str] = Field(default_factory=list)
 
 
@@ -233,6 +280,35 @@ class Finding(BaseModel):
     file: Path | None = None
     range: SourceRange | None = None
     related_files: tuple[Path, ...] = ()
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# =============================================================================
+# Retrieval (Phase 2)
+# =============================================================================
+
+
+class Chunk(BaseModel):
+    """A retrievable unit of source content.
+
+    The retrieval system slices a repository into chunks at symbol
+    boundaries (via :class:`SymbolAwareChunker`) and indexes them with
+    BM25 + dense vectors. Each chunk carries enough context to be
+    self-contained when packed into an LLM's prompt: source text,
+    file path, line range, and a back-reference to its symbol's
+    qualified name (so the graph expansion stage can find structural
+    neighbors).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str  # deterministic: "<file_path>::<symbol_qname>" or "<file_path>::lines:<a>-<b>"
+    file_path: Path
+    text: str
+    start_line: int
+    end_line: int
+    symbol_qname: str | None = None
+    language: Language = Language.UNKNOWN
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -363,6 +439,7 @@ class JobResult(BaseModel):
 
 __all__ = [
     "BuildSystem",
+    "Chunk",
     "Ecosystem",
     "FileEdit",
     "FileRef",
@@ -380,6 +457,9 @@ __all__ = [
     "SourceRange",
     "Symbol",
     "SymbolKind",
+    "UnresolvedCall",
+    "UnresolvedInheritance",
+    "UnresolvedReference",
     "ValidationReport",
     "ValidationResult",
     "Verdict",

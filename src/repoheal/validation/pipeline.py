@@ -22,6 +22,7 @@ from ..core.models import (
 )
 from ..core.protocols import Validator
 from ..logging import get_logger
+from ..obs.tracing import traced
 
 _log = get_logger(__name__)
 
@@ -38,38 +39,40 @@ class ValidationPipeline:
         results: list[ValidationResult] = []
         overall = Verdict.PASS
 
-        for v in self._validators:
-            try:
-                result = v.validate(repo, patch)
-            except Exception as exc:
-                _log.warning(
-                    "validation.validator_crashed",
-                    validator=v.name,
-                    error=str(exc),
-                )
-                result = ValidationResult(
-                    validator=v.name,
-                    verdict=Verdict.ERROR,
-                    summary=f"validator crashed: {exc}",
-                )
+        with traced("validation.pipeline", validators=len(self._validators)):
+            for v in self._validators:
+                with traced("validation.validator", name=v.name):
+                    try:
+                        result = v.validate(repo, patch)
+                    except Exception as exc:
+                        _log.warning(
+                            "validation.validator_crashed",
+                            validator=v.name,
+                            error=str(exc),
+                        )
+                        result = ValidationResult(
+                            validator=v.name,
+                            verdict=Verdict.ERROR,
+                            summary=f"validator crashed: {exc}",
+                        )
+                        results.append(result)
+                        overall = Verdict.FAIL  # fail-closed
+                        break
+
                 results.append(result)
-                overall = Verdict.FAIL  # fail-closed
-                break
+                _log.info(
+                    "validation.result",
+                    validator=v.name,
+                    verdict=result.verdict.value,
+                )
 
-            results.append(result)
-            _log.info(
-                "validation.result",
-                validator=v.name,
-                verdict=result.verdict.value,
-            )
-
-            if result.verdict == Verdict.FAIL:
-                overall = Verdict.FAIL
-                break  # short-circuit: cheap validators fail before expensive ones run
-            if result.verdict == Verdict.ERROR:
-                overall = Verdict.FAIL
-                break
-            if result.verdict == Verdict.WARN and overall == Verdict.PASS:
-                overall = Verdict.WARN
+                if result.verdict == Verdict.FAIL:
+                    overall = Verdict.FAIL
+                    break
+                if result.verdict == Verdict.ERROR:
+                    overall = Verdict.FAIL
+                    break
+                if result.verdict == Verdict.WARN and overall == Verdict.PASS:
+                    overall = Verdict.WARN
 
         return ValidationReport(overall=overall, results=tuple(results))

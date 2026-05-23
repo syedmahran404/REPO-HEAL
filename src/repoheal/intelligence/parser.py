@@ -122,6 +122,29 @@ class TreeSitterParser:
                     error=str(exc),
                 )
 
+            # Phase 2: calls, inheritance, references — all optional per
+            # extractor (Python implements; others raise NotImplementedError).
+            for method, field in (
+                ("extract_calls", "calls"),
+                ("extract_inheritance", "inherits"),
+                ("extract_references", "references"),
+            ):
+                fn = getattr(extractor, method, None)
+                if fn is None:
+                    continue
+                try:
+                    items = fn(parsed, source, tree=tree)
+                    parsed = parsed.model_copy(update={field: list(items)})
+                except NotImplementedError:
+                    continue
+                except Exception as exc:
+                    _log.warning(
+                        "parser.extractor_phase2_failed",
+                        method=method,
+                        path=str(file.path),
+                        error=str(exc),
+                    )
+
         return parsed
 
     # ------------------------------------------------------------------

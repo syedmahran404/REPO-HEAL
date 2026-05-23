@@ -1,38 +1,53 @@
-"""Multi-agent system — INTERFACE-DEFINED ONLY in Phase 1.
+"""Multi-agent system.
 
-The orchestration model is documented in
-:doc:`docs/ARCHITECTURE.md` §4.5. Implementation is gated on the
-choice of state-machine vs. LangGraph (ADR-0004, forthcoming).
+Phase 1 shipped Protocol-only contracts.
 
-Agents and their contracts:
+Phase 2 implements the runtime:
 
-* ``RepositoryArchitectAgent`` — produces a high-level structural map.
-* ``DependencyAnalysisAgent`` — surfaces fragile / risky dependencies.
-* ``BugDetectionAgent`` — orchestrates rule-based + LLM-based detectors.
-* ``RootCauseAgent`` — walks the graph backward from a failure.
-* ``SecurityAnalysisAgent`` — surfaces secrets, weak crypto, etc.
-* ``RefactoringAgent`` — proposes structural improvements.
-* ``PatchGenerationAgent`` — proposes a Patch given a Finding + context.
-* ``RegressionPreventionAgent`` — proposes additional tests around a fix.
-* ``TestGenerationAgent`` — generates tests for uncovered code.
-* ``ValidationAgent`` — wraps the ValidationPipeline as an agent step.
-* ``PerformanceOptimizationAgent`` — surfaces hot paths from telemetry.
-* ``DocumentationAgent`` — generates / updates docstrings & ADRs.
-* ``CICDAgent`` — proposes CI workflow changes.
-* ``AutonomousPlanningAgent`` — top-level planner.
+* :class:`MemoryBus` (Protocol) + :class:`InMemoryBus` /
+  :class:`JsonFileMemoryBus` — durable key/value store passed to every
+  step.
+* :class:`AgentStep` + :class:`ExecutionDAG` — typed adjacency list
+  with cycle detection and topological layering.
+* :class:`AgentRunner` — runs one step with bounded retries and
+  wallclock timeout.
+* :class:`Orchestrator` — schedules a DAG with parallel layers and
+  durable replay (re-runs with the same ``run_id`` skip persisted steps).
+* :class:`AgentRegistry` — name → factory.
 
-Each agent ultimately produces a structured result; the planner
-composes them. None of this is implemented in Phase 1.
+Real agents shipping in Phase 2:
+
+* :class:`RootCauseAgent` — graph-walking, retrieval-aware,
+  no-LLM. Real code, real tests.
+
+LLM-backed agents (PatchGenerationAgent, etc.) land on the same
+:class:`Agent` Protocol once the ``LLMClient`` Protocol is added.
 """
 
 from .base import AgentResult, AgentStatus
+from .memory import InMemoryBus, JsonFileMemoryBus, MemoryBus
+from .orchestrator import Orchestrator
 from .protocols import Agent, Plan, PlannerAgent, ToolCall
+from .registry import AgentRegistry, default_registry
+from .root_cause import RootCauseAgent, RootCauseHypothesis
+from .runtime import AgentRunner, AgentStep, ExecutionDAG
 
 __all__ = [
     "Agent",
+    "AgentRegistry",
     "AgentResult",
+    "AgentRunner",
     "AgentStatus",
+    "AgentStep",
+    "ExecutionDAG",
+    "InMemoryBus",
+    "JsonFileMemoryBus",
+    "MemoryBus",
+    "Orchestrator",
     "Plan",
     "PlannerAgent",
+    "RootCauseAgent",
+    "RootCauseHypothesis",
     "ToolCall",
+    "default_registry",
 ]
